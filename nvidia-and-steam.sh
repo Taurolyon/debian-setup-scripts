@@ -5,10 +5,8 @@
 # =======================================================================
 
 # Configuration Variables
-REQUIRED_COMPONENTS=("contrib" "non-free" "non-free-firmware")
-# Note: non-free-firmware is typically present by default on Debian Trixie installations
-# but is often missing 'contrib' and 'non-free'. 
-# We target the insertion of these two first, as they are the source of your error.
+# Redefining COMPONENTS as an array for targeted checking
+REQUIRED_COMPONENTS=("contrib" "non-free" "non-free-firmware") 
 SOURCES_DIR="/etc/apt"
 LISTS_DIR="${SOURCES_DIR}/sources.list.d"
 MAIN_FILE="${SOURCES_DIR}/sources.list"
@@ -73,33 +71,44 @@ add_to_list_file() {
     local temp_file
     local component_added=0
     
+    # Check 1: Is it a Debian official source file?
     if grep -qE "deb.*(${DEBIAN_URIS})" "$file"; then
         
-        # Iterate over each required component
+        # Iterate over each required component (contrib, non-free, non-free-firmware)
         for COMPONENT in "${REQUIRED_COMPONENTS[@]}"; do
-            # Check if the current component is missing in any active line
-            if ! grep -vE '^\s*#' "$file" | grep -qE "\s$COMPONENT(\s|$)"; then
-                temp_file=$(mktemp)
+            
+            # Check if the current component is missing in any active, official line
+            # We check the file itself because we need to update it in place.
+            if ! grep -vE '^\s*#' "$file" | grep -qE "deb.*(${DEBIAN_URIS}).*(\s$COMPONENT|\s$COMPONENT\s)"; then
                 
-                # SED command to insert only the missing COMPONENT right after 'main'
-                # Match: (\s+main)(\s.*) -> Capture ' main' and everything after the following space.
-                # Replace: \1 COMPONENT\2 -> Inserts the missing component after 'main'.
+                # If component is missing, prepare temporary file
+                temp_file=$(mktemp)
+
+                # SED command: Insert only the missing COMPONENT
+                # Strategy: Replace the entire line's content with itself PLUS the missing component.
+                # A simpler, safer strategy for sequential insertion: target 'main'
+                
+                # Check if 'main' is missing, then insert component after it.
                 if sed -E "/^(deb|deb-src) /I { 
                     /(${DEBIAN_URIS})/ { 
-                        /main/I s/(\s+main)(\s+.*)/\1 ${COMPONENT}\2/I; 
+                        # If the line contains 'main' but NOT the component, insert it.
+                        /main/I !/\s${COMPONENT}/ {
+                            s/(\s+main)(\s+.*)/\1 ${COMPONENT}\2/I;
+                        }
                     } 
                 }" "$file" > "$temp_file"; then
                     
+                    # Check if the file was modified
                     if ! cmp -s "$file" "$temp_file"; then
                         echo "-> Inserted '${COMPONENT}' into ${file}."
                         mv "$temp_file" "$file"
                         component_added=1
                     else
-                        # If sed runs but no change is made (e.g., 'main' wasn't found in a line)
+                        # If sed runs but makes no change (e.g., component was added in a previous run)
                         rm "$temp_file"
                     fi
                 else
-                    echo "Error: Failed to process ${file} with sed."
+                    echo "Error: Failed to process ${file} with sed while adding ${COMPONENT}."
                     rm "$temp_file"
                     return 1
                 fi
@@ -107,14 +116,15 @@ add_to_list_file() {
         done
         
         if [ "$component_added" -eq 1 ]; then
-            echo "-> Finished updating ${file}."
+            echo "-> Finished applying updates to ${file}."
         else
-            echo "-> All required components (${REQUIRED_COMPONENTS[*]}) already present in ${file}. Skipping."
+            echo "-> All required components are already present in ${file}. Skipping."
         fi
     else
         echo "-> File ${file} does not contain official Debian entries. Skipping component addition."
     fi
 }
+
 
 # --- Function to add components to a .sources file (deb822 style) ---
 add_to_sources_file() {
@@ -124,21 +134,18 @@ add_to_sources_file() {
     
     if grep -qE "URIs:.*(${DEBIAN_URIS})" "$file"; then
         
-        # Iterate over each required component
+        # Iterate and apply changes sequentially for each missing component
         for COMPONENT in "${REQUIRED_COMPONENTS[@]}"; do
             # Check if the component is missing in any Components line in the file
             if ! grep -vE '^\s*#' "$file" | grep -qE "Components:.*$COMPONENT"; then
                 temp_file=$(mktemp)
                 
                 # AWK LOGIC: Only modify if COMPONENT is missing and URI matches.
+                # The file is overwritten on each loop if a component is missing.
                 if awk -v component_to_add="$COMPONENT" -v uris="$DEBIAN_URIS" '
-                    /Types:/ { 
-                        is_debian_stanza = 0; 
-                    }
+                    /Types:/ { is_debian_stanza = 0; }
                     
-                    /URIs:.*('"${uris}"')/ { 
-                        is_debian_stanza = 1; 
-                    }
+                    /URIs:.*('"${uris}"')/ { is_debian_stanza = 1; }
                     
                     /^[[:space:]]*Components:/ && is_debian_stanza && $0 !~ component_to_add {
                         $0 = $0 " " component_to_add;
@@ -161,9 +168,9 @@ add_to_sources_file() {
         done
         
         if [ "$component_added" -eq 1 ]; then
-            echo "-> Finished updating ${file}."
+            echo "-> Finished applying updates to ${file}."
         else
-            echo "-> All required components (${REQUIRED_COMPONENTS[*]}) already present in ${file}. Skipping."
+            echo "-> All required components are already present in ${file}. Skipping."
         fi
     else
         echo "-> File ${file} does not contain official Debian entries. Skipping component addition."
