@@ -7,12 +7,36 @@ LISTS_DIR="${SOURCES_DIR}/sources.list.d"
 MAIN_FILE="${SOURCES_DIR}/sources.list"
 BACKUP_DIR="/var/backups/apt-sources"
 
-# --- Root Check ---
+# -----------------------------------------------------------------------
+# --- Privilege Check and Elevation ---
+# -----------------------------------------------------------------------
 if [ "$(id -u)" -ne 0 ]; then
-    echo "🚨 ERROR: This script must be run as root or with sudo."
-    echo "Please run: sudo $0"
-    exit 1
+    echo "⚠️ Not running as root. Re-executing script with 'sudo'..."
+    exec sudo "$0" "$@"
 fi
+
+echo "✅ Running script with root privileges."
+
+# -----------------------------------------------------------------------
+# --- Functions ---
+# -----------------------------------------------------------------------
+
+# --- Architecture Check and Enable Function (Included for completeness) ---
+check_and_enable_i386() {
+    echo "Checking for i386 architecture support..."
+    if dpkg --print-foreign-architectures | grep -q 'i386'; then
+        echo "✅ i386 architecture is already enabled."
+    else
+        echo "⚠️ i386 architecture is NOT enabled. Enabling now..."
+        if dpkg --add-architecture i386; then
+            echo "✅ i386 architecture successfully added."
+        else
+            echo "❌ ERROR: Failed to add i386 architecture."
+            return 1
+        fi
+    fi
+    return 0
+}
 
 # --- Backup Function ---
 backup_apt_sources() {
@@ -21,15 +45,12 @@ backup_apt_sources() {
     
     echo "Creating backup of ${SOURCES_DIR}/sources.list and ${LISTS_DIR}/..."
     
-    # Ensure the backup directory exists (already running as root)
     if ! mkdir -p "$BACKUP_DIR"; then
         echo "Error: Failed to create backup directory ${BACKUP_DIR}. Aborting backup."
         return 1
     fi
 
-    # Create the tar.gz archive
-    # The -C flag ensures paths in the archive are relative (e.g., sources.list, not /etc/apt/sources.list)
-    if tar -czf "${BACKUP_DIR}/${archive_name}" -C "${SOURCES_DIR}" sources.list -C "${SOURCES_DIR}" sources.list.d; then
+    if tar -czf "${BACKUP_DIR}/${archive_name}" -C "${SOURCES_DIR}" sources.list -C "${SOURCES_DIR}" sources.list.d 2>/dev/null; then
         echo "✅ Backup successful: ${BACKUP_DIR}/${archive_name}"
         return 0
     else
@@ -38,23 +59,16 @@ backup_apt_sources() {
     fi
 }
 
-# --- Core Logic Functions ---
-
-# Function to add components to a .list file (one-line style)
+# --- Function to add components to a .list file (one-line style) ---
 add_to_list_file() {
     local file="$1"
     local temp_file
     
-    # Check if the components are already present (ignoring commented lines)
     if ! grep -vE '^\s*#' "$file" | grep -qE 'contrib|non-free|non-free-firmware'; then
         temp_file=$(mktemp)
 
-        # Look for the 'main' component and insert the new components after it.
-        # This targets lines starting with deb/deb-src and ensures main is present before substitution.
-        # The 'I' flag enables case-insensitive matching for 'deb'/'deb-src' and 'main'.
         if sed -E "/^(deb|deb-src) /I { /main/I s/(\s+main)(\s+|$)/\1 ${COMPONENTS}\2/I; }" "$file" > "$temp_file"; then
             
-            # Check if any effective change was made by comparing files
             if ! cmp -s "$file" "$temp_file"; then
                 echo "-> Updated file: ${file}"
                 mv "$temp_file" "$file"
@@ -71,27 +85,23 @@ add_to_list_file() {
     fi
 }
 
-# Function to add components to a .sources file (deb822 style)
+# --- Function to add components to a .sources file (deb822 style) ---
 add_to_sources_file() {
     local file="$1"
     local temp_file
     temp_file=$(mktemp)
 
-    # Use awk to find 'Components:' lines and append missing components.
     if awk -v components_to_add="$COMPONENTS" '
-        # Look for Components: line that does NOT contain contrib
         /^[[:space:]]*Components:/ && !/contrib/ {
-            # Append the new components
             $0 = $0 " " components_to_add
             changed = 1
         }
         { print }
-        END { exit !changed } # Non-zero exit if no change was made
+        END { exit !changed }
     ' "$file" > "$temp_file"; then
         echo "-> Updated file: ${file}"
         mv "$temp_file" "$file"
     else
-        # Awk exited non-zero (or failed)
         if grep -qE '^[[:space:]]*Components:.*(contrib|non-free|non-free-firmware)' "$file"; then
             echo "-> Components already present in ${file}. Skipping."
         else
@@ -101,39 +111,48 @@ add_to_sources_file() {
     fi
 }
 
-# --- Main Script Execution ---
+# -----------------------------------------------------------------------
+#                           MAIN EXECUTION
+# -----------------------------------------------------------------------
 
-echo "Starting component addition for Debian Trixie (Debian 13)."
+echo "Starting configuration script for Debian Trixie (Debian 13)."
 
-# 1. Run the backup
+# 1. Check/Enable i386 architecture
+echo
+if ! check_and_enable_i386; then
+    echo "Architecture configuration failed. Exiting script."
+    exit 1
+fi
+
+# 2. Run the backup
+echo
 if ! backup_apt_sources; then
     echo "Script cannot proceed without a successful backup. Exiting."
     exit 1
 fi
 
 echo ""
-# 2. Processing /etc/apt/sources.list (if it exists)
+echo "Starting APT component modification."
+
+# 3. Processing /etc/apt/sources.list 
 if [ -f "$MAIN_FILE" ]; then
     echo "Processing main file: $MAIN_FILE"
-    # Check if it's likely a deb822 file by looking for 'Types:'
     if grep -q '^Types:' "$MAIN_FILE"; then
         add_to_sources_file "$MAIN_FILE"
     else
         add_to_list_file "$MAIN_FILE"
     fi
 else
-    echo "Main file $MAIN_FILE not found (typical with modern Debian installs using *.sources). Skipping."
+    echo "Main file $MAIN_FILE not found. Skipping."
 fi
 
-# 3. Processing files in /etc/apt/sources.list.d/
+# 4. Processing files in /etc/apt/sources.list.d/
 echo ""
 echo "Processing files in $LISTS_DIR/..."
 if [ -d "$LISTS_DIR" ]; then
-    # Find all .list and .sources files and process them
     find "$LISTS_DIR" -type f \( -name "*.list" -o -name "*.sources" \) -print0 | while IFS= read -r -d $'\0' file; do
         echo "Processing file: ${file}"
         
-        # Check the extension to determine the format
         if [[ "$file" == *.list ]]; then
             add_to_list_file "$file"
         elif [[ "$file" == *.sources ]]; then
@@ -144,8 +163,15 @@ else
     echo "Directory $LISTS_DIR not found. Skipping."
 fi
 
+# 5. Execute apt update automatically
 echo ""
-echo "Finished modifying APT sources."
 echo "************************************************************************"
-echo "ATTENTION: You must now run 'apt update' to refresh your package list."
+echo "Refreshing package lists (apt update)..."
+if apt update; then
+    echo "✅ Package lists successfully refreshed."
+else
+    echo "❌ ERROR: apt update failed. Please investigate source file errors."
+    exit 1
+fi
 echo "************************************************************************"
+echo "Finished configuration script."
