@@ -5,7 +5,6 @@
 # =======================================================================
 
 # Configuration Variables
-# Redefining COMPONENTS as an array for targeted checking
 REQUIRED_COMPONENTS=("contrib" "non-free" "non-free-firmware") 
 SOURCES_DIR="/etc/apt"
 LISTS_DIR="${SOURCES_DIR}/sources.list.d"
@@ -71,44 +70,34 @@ add_to_list_file() {
     local temp_file
     local component_added=0
     
-    # Check 1: Is it a Debian official source file?
     if grep -qE "deb.*(${DEBIAN_URIS})" "$file"; then
         
-        # Iterate over each required component (contrib, non-free, non-free-firmware)
         for COMPONENT in "${REQUIRED_COMPONENTS[@]}"; do
-            
             # Check if the current component is missing in any active, official line
-            # We check the file itself because we need to update it in place.
             if ! grep -vE '^\s*#' "$file" | grep -qE "deb.*(${DEBIAN_URIS}).*(\s$COMPONENT|\s$COMPONENT\s)"; then
                 
-                # If component is missing, prepare temporary file
                 temp_file=$(mktemp)
 
-                # SED command: Insert only the missing COMPONENT
-                # Strategy: Replace the entire line's content with itself PLUS the missing component.
-                # A simpler, safer strategy for sequential insertion: target 'main'
+                # --- THE CRITICAL FIX: Simplified SED expression ---
+                # We use a single quote block for sed, and rely on the negative look-ahead 
+                # implicit in the loop's `if` check above.
+                # The pattern targets lines containing a Debian URI, has 'main', but LACKS the specific COMPONENT.
                 
-                # Check if 'main' is missing, then insert component after it.
-                if sed -E "/^(deb|deb-src) /I { 
-                    /(${DEBIAN_URIS})/ { 
-                        # If the line contains 'main' but NOT the component, insert it.
-                        /main/I !/\s${COMPONENT}/ {
-                            s/(\s+main)(\s+.*)/\1 ${COMPONENT}\2/I;
-                        }
-                    } 
-                }" "$file" > "$temp_file"; then
+                # The replacement pattern finds (\smain) and inserts the component before the rest of the line's content (.*)
+                
+                local sed_pattern="/^(deb|deb-src) /I { /(${DEBIAN_URIS})/ { /main/I !/\s${COMPONENT}/ { s/(\s+main)(\s+.*)/\1 ${COMPONENT}\2/I; } } }"
+                
+                if sed -E "$sed_pattern" "$file" > "$temp_file"; then
                     
-                    # Check if the file was modified
                     if ! cmp -s "$file" "$temp_file"; then
                         echo "-> Inserted '${COMPONENT}' into ${file}."
                         mv "$temp_file" "$file"
                         component_added=1
                     else
-                        # If sed runs but makes no change (e.g., component was added in a previous run)
                         rm "$temp_file"
                     fi
                 else
-                    echo "Error: Failed to process ${file} with sed while adding ${COMPONENT}."
+                    echo "Error: Failed to process ${file} with sed while adding ${COMPONENT}. Check the sed pattern syntax."
                     rm "$temp_file"
                     return 1
                 fi
@@ -134,14 +123,10 @@ add_to_sources_file() {
     
     if grep -qE "URIs:.*(${DEBIAN_URIS})" "$file"; then
         
-        # Iterate and apply changes sequentially for each missing component
         for COMPONENT in "${REQUIRED_COMPONENTS[@]}"; do
-            # Check if the component is missing in any Components line in the file
             if ! grep -vE '^\s*#' "$file" | grep -qE "Components:.*$COMPONENT"; then
                 temp_file=$(mktemp)
                 
-                # AWK LOGIC: Only modify if COMPONENT is missing and URI matches.
-                # The file is overwritten on each loop if a component is missing.
                 if awk -v component_to_add="$COMPONENT" -v uris="$DEBIAN_URIS" '
                     /Types:/ { is_debian_stanza = 0; }
                     
@@ -163,7 +148,7 @@ add_to_sources_file() {
                     fi
                     
                 fi
-                rm "$temp_file" # Clean up temp file regardless of status
+                rm "$temp_file"
             fi
         done
         
@@ -174,7 +159,7 @@ add_to_sources_file() {
         fi
     else
         echo "-> File ${file} does not contain official Debian entries. Skipping component addition."
-    fi
+    }
 }
 
 # -----------------------------------------------------------------------
