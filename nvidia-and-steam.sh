@@ -5,11 +5,15 @@
 # =======================================================================
 
 # Configuration Variables
-COMPONENTS="contrib non-free non-free-firmware"
+REQUIRED_COMPONENTS=("contrib" "non-free" "non-free-firmware")
+# Note: non-free-firmware is typically present by default on Debian Trixie installations
+# but is often missing 'contrib' and 'non-free'. 
+# We target the insertion of these two first, as they are the source of your error.
 SOURCES_DIR="/etc/apt"
 LISTS_DIR="${SOURCES_DIR}/sources.list.d"
 MAIN_FILE="${SOURCES_DIR}/sources.list"
 BACKUP_DIR="/var/backups/apt-sources"
+DEBIAN_URIS="deb.debian.org/debian|security.debian.org"
 
 # -----------------------------------------------------------------------
 # --- Privilege Check and Elevation ---
@@ -67,37 +71,45 @@ backup_apt_sources() {
 add_to_list_file() {
     local file="$1"
     local temp_file
+    local component_added=0
     
-    # 1. Check if it's an official Debian source file
-    if grep -qE 'deb.*(deb.debian.org/debian|security.debian.org)' "$file"; then
+    if grep -qE "deb.*(${DEBIAN_URIS})" "$file"; then
         
-        # 2. Check if it is MISSING 'contrib' OR 'non-free' in any active line
-        if ! grep -vE '^\s*#' "$file" | grep -qE 'contrib|non-free'; then
-            temp_file=$(mktemp)
-
-            # CORRECTED SED COMMAND (Now only adds missing components: contrib non-free)
-            # It looks for 'main' followed by a space and ANYTHING else (including non-free-firmware)
-            if sed -E "/^(deb|deb-src) /I { 
-                /(deb.debian.org\/debian|security.debian.org)/ { 
-                    # Match 'main' followed by a space, and capture everything after the space (e.g., 'non-free-firmware')
-                    /main/I s/(\s+main)(\s+.*)/\1 contrib non-free\2/I; 
-                } 
-            }" "$file" > "$temp_file"; then
+        # Iterate over each required component
+        for COMPONENT in "${REQUIRED_COMPONENTS[@]}"; do
+            # Check if the current component is missing in any active line
+            if ! grep -vE '^\s*#' "$file" | grep -qE "\s$COMPONENT(\s|$)"; then
+                temp_file=$(mktemp)
                 
-                # Check if the file was modified
-                if ! cmp -s "$file" "$temp_file"; then
-                    echo "-> Updated file: ${file} (Added missing contrib and non-free)"
-                    mv "$temp_file" "$file"
+                # SED command to insert only the missing COMPONENT right after 'main'
+                # Match: (\s+main)(\s.*) -> Capture ' main' and everything after the following space.
+                # Replace: \1 COMPONENT\2 -> Inserts the missing component after 'main'.
+                if sed -E "/^(deb|deb-src) /I { 
+                    /(${DEBIAN_URIS})/ { 
+                        /main/I s/(\s+main)(\s+.*)/\1 ${COMPONENT}\2/I; 
+                    } 
+                }" "$file" > "$temp_file"; then
+                    
+                    if ! cmp -s "$file" "$temp_file"; then
+                        echo "-> Inserted '${COMPONENT}' into ${file}."
+                        mv "$temp_file" "$file"
+                        component_added=1
+                    else
+                        # If sed runs but no change is made (e.g., 'main' wasn't found in a line)
+                        rm "$temp_file"
+                    fi
                 else
-                    echo "-> Official entries already contain contrib/non-free. No changes made."
+                    echo "Error: Failed to process ${file} with sed."
                     rm "$temp_file"
+                    return 1
                 fi
-            else
-                echo "Error: Failed to process ${file} with sed."
-                rm "$temp_file"
             fi
+        done
+        
+        if [ "$component_added" -eq 1 ]; then
+            echo "-> Finished updating ${file}."
         else
-            echo "-> Components (contrib/non-free) already present in official entries in ${file}. Skipping."
+            echo "-> All required components (${REQUIRED_COMPONENTS[*]}) already present in ${file}. Skipping."
         fi
     else
         echo "-> File ${file} does not contain official Debian entries. Skipping component addition."
@@ -108,37 +120,50 @@ add_to_list_file() {
 add_to_sources_file() {
     local file="$1"
     local temp_file
-    temp_file=$(mktemp)
-
-    if grep -qE 'URIs:.*(deb.debian.org/debian|security.debian.org)' "$file"; then
+    local component_added=0
+    
+    if grep -qE "URIs:.*(${DEBIAN_URIS})" "$file"; then
         
-        # AWK LOGIC for deb822 format (fixed to respect stanzas)
-        if awk -v components_to_add="$COMPONENTS" '
-            /Types:/ { 
-                is_debian_stanza = 0; 
-            }
-            
-            /URIs:.*(deb.debian.org\/debian|security.debian.org)/ { 
-                is_debian_stanza = 1; 
-            }
-            
-            /^[[:space:]]*Components:/ && is_debian_stanza && !/contrib/ {
-                $0 = $0 " " components_to_add;
-                changed = 1;
-            }
-            
-            { print }
-            END { exit !changed }
-        ' "$file" > "$temp_file"; then
-            echo "-> Updated file: ${file}"
-            mv "$temp_file" "$file"
-        else
-            if grep -qE '^[[:space:]]*Components:.*(contrib|non-free|non-free-firmware)' "$file"; then
-                echo "-> Official entries already updated. Skipping."
-            else
-                echo "-> Could not find 'Components:' line to update in official entry of ${file} or no change was necessary."
+        # Iterate over each required component
+        for COMPONENT in "${REQUIRED_COMPONENTS[@]}"; do
+            # Check if the component is missing in any Components line in the file
+            if ! grep -vE '^\s*#' "$file" | grep -qE "Components:.*$COMPONENT"; then
+                temp_file=$(mktemp)
+                
+                # AWK LOGIC: Only modify if COMPONENT is missing and URI matches.
+                if awk -v component_to_add="$COMPONENT" -v uris="$DEBIAN_URIS" '
+                    /Types:/ { 
+                        is_debian_stanza = 0; 
+                    }
+                    
+                    /URIs:.*('"${uris}"')/ { 
+                        is_debian_stanza = 1; 
+                    }
+                    
+                    /^[[:space:]]*Components:/ && is_debian_stanza && $0 !~ component_to_add {
+                        $0 = $0 " " component_to_add;
+                        changed = 1;
+                    }
+                    
+                    { print }
+                    END { exit !changed }
+                ' "$file" > "$temp_file"; then
+                    
+                    if ! cmp -s "$file" "$temp_file"; then
+                        echo "-> Inserted '${COMPONENT}' into ${file}."
+                        mv "$temp_file" "$file"
+                        component_added=1
+                    fi
+                    
+                fi
+                rm "$temp_file" # Clean up temp file regardless of status
             fi
-            rm "$temp_file"
+        done
+        
+        if [ "$component_added" -eq 1 ]; then
+            echo "-> Finished updating ${file}."
+        else
+            echo "-> All required components (${REQUIRED_COMPONENTS[*]}) already present in ${file}. Skipping."
         fi
     else
         echo "-> File ${file} does not contain official Debian entries. Skipping component addition."
@@ -168,7 +193,7 @@ fi
 echo ""
 echo "Starting APT component modification."
 
-# 3. Processing /etc/apt/sources.list and /etc/apt/sources.list.d/
+# 3. Processing /etc/apt/sources.list 
 if [ -f "$MAIN_FILE" ]; then
     echo "Processing main file: $MAIN_FILE"
     if grep -q '^Types:' "$MAIN_FILE"; then
@@ -180,6 +205,9 @@ else
     echo "Main file $MAIN_FILE not found. Skipping."
 fi
 
+# 4. Processing files in /etc/apt/sources.list.d/
+echo ""
+echo "Processing files in $LISTS_DIR/..."
 if [ -d "$LISTS_DIR" ]; then
     find "$LISTS_DIR" -type f \( -name "*.list" -o -name "*.sources" \) -print0 | while IFS= read -r -d $'\0' file; do
         echo "Processing file: ${file}"
@@ -194,7 +222,7 @@ else
     echo "Directory $LISTS_DIR not found. Skipping."
 fi
 
-# 4. Execute first apt update to refresh package lists with new sources/architecture
+# 5. Execute first apt update to refresh package lists with new sources/architecture
 echo ""
 echo "************************************************************************"
 echo "Refreshing package lists (apt update)..."
@@ -213,7 +241,7 @@ echo "************************************************************************"
 echo ""
 echo "Starting NVIDIA Driver and Steam installation."
 
-# 5. Install the packages
+# 6. Install the packages
 if ! apt install -y \
     linux-headers-$(dpkg --print-architecture) \
     nvidia-kernel-dkms \
@@ -230,7 +258,7 @@ then
     exit 1
 fi
 
-# 6. Append the configuration line
+# 7. Append the configuration line
 CONFIG_FILE="/etc/modprobe.d/nvidia-options.conf"
 CONFIG_LINE="options nvidia NVreg_PreserveVideoMemoryAllocations=1"
 
