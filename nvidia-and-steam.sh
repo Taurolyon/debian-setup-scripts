@@ -69,41 +69,49 @@ add_to_list_file() {
     local file="$1"
     local temp_file
     local component_added=0
+    local SED_SCRIPT=""
     
     if grep -qE "deb.*(${DEBIAN_URIS})" "$file"; then
         
+        # 1. Build a SED script string that adds all missing components sequentially
         for COMPONENT in "${REQUIRED_COMPONENTS[@]}"; do
-            # Check if the current component is missing in any active, official line
+            
+            # Check if the component is missing in any active, official line
             if ! grep -vE '^\s*#' "$file" | grep -qE "deb.*(${DEBIAN_URIS}).*(\s$COMPONENT|\s$COMPONENT\s)"; then
                 
-                temp_file=$(mktemp)
-
-                # --- THE CRITICAL FIX: Simplified SED expression ---
-                # We use a single quote block for sed, and rely on the negative look-ahead 
-                # implicit in the loop's `if` check above.
-                # The pattern targets lines containing a Debian URI, has 'main', but LACKS the specific COMPONENT.
-                
-                # The replacement pattern finds (\smain) and inserts the component before the rest of the line's content (.*)
-                
-                local sed_pattern="/^(deb|deb-src) /I { /(${DEBIAN_URIS})/ { /main/I !/\s${COMPONENT}/ { s/(\s+main)(\s+.*)/\1 ${COMPONENT}\2/I; } } }"
-                
-                if sed -E "$sed_pattern" "$file" > "$temp_file"; then
-                    
-                    if ! cmp -s "$file" "$temp_file"; then
-                        echo "-> Inserted '${COMPONENT}' into ${file}."
-                        mv "$temp_file" "$file"
-                        component_added=1
-                    else
-                        rm "$temp_file"
-                    fi
-                else
-                    echo "Error: Failed to process ${file} with sed while adding ${COMPONENT}. Check the sed pattern syntax."
-                    rm "$temp_file"
-                    return 1
-                fi
+                # Append a sed substitution command to the script
+                # We target lines containing the URI and 'main', but not the component, and insert the component.
+                # The 't' command branches to the end if a substitution is made, preventing double-runs on the same line if possible.
+                SED_SCRIPT="${SED_SCRIPT} /${DEBIAN_URIS}/ { /main/I !/\s${COMPONENT}/ s/(\s+main)(\s+.*)/\1 ${COMPONENT}\2/I; } "
             fi
         done
         
+        # 2. Execute the combined SED script if changes are needed
+        if [ -n "$SED_SCRIPT" ]; then
+            temp_file=$(mktemp)
+            
+            # Remove any leading/trailing whitespace from the SED_SCRIPT before execution
+            SED_SCRIPT=$(echo "$SED_SCRIPT" | xargs) 
+            
+            # Execute the combined script
+            if sed -E "$SED_SCRIPT" "$file" > "$temp_file"; then
+                
+                if ! cmp -s "$file" "$temp_file"; then
+                    echo "-> Updated file: ${file} (Components added)"
+                    mv "$temp_file" "$file"
+                    component_added=1
+                else
+                    echo "-> All components were somehow present after checking. No changes made."
+                    rm "$temp_file"
+                fi
+            else
+                echo "❌ Error: Failed to process ${file} with sed. Check SED syntax (Unmatched parenthesis)."
+                rm "$temp_file"
+                return 1
+            fi
+        fi
+        
+        # 3. Final reporting
         if [ "$component_added" -eq 1 ]; then
             echo "-> Finished applying updates to ${file}."
         else
