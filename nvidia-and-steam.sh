@@ -69,8 +69,8 @@ add_to_list_file() {
     local file="$1"
     local temp_file
     local component_added=0
+    local SED_SCRIPT=""
     
-    # Check 1: Is it a Debian official source file?
     if grep -qE "deb.*(${DEBIAN_URIS})" "$file"; then
         
         for COMPONENT in "${REQUIRED_COMPONENTS[@]}"; do
@@ -78,66 +78,59 @@ add_to_list_file() {
             # Check if the current component is missing in any active, official line
             if ! grep -vE '^\s*#' "$file" | grep -qE "deb.*(${DEBIAN_URIS}).*(\s$COMPONENT|\s$COMPONENT\s)"; then
                 
-                temp_file=$(mktemp)
-
-                # --- THE FINAL FIX: Robust SED pattern (avoids nesting) ---
-                # Targets: Official deb/deb-src lines containing 'main' but lacking the specific COMPONENT.
-                # Inserts: The missing component right after 'main'.
-                local sed_pattern="/^(deb|deb-src) /I { 
-                    /(${DEBIAN_URIS})/ {
-                        /main/I !/\s${COMPONENT}/ {
-                            s/(\s+main)(\s+.*)/\1 ${COMPONENT}\2/I;
-                        }
-                    }
-                }"
-                
-                # We need to simplify the sed command even further, moving the address filtering out
-                # to avoid the nested brace syntax failure.
-                
-                # --- MOST RELIABLE SED SYNTAX (No nested addresses/commands) ---
-                # We pipe the output of grep (lines to modify) to sed and then merge.
-                
-                # Step 1: Filter lines that need modification (official, active, has main, lacks component)
-                local lines_to_modify
-                lines_to_modify=$(grep -vE '^\s*#' "$file" | grep -E "deb.*(${DEBIAN_URIS}).*main" | grep -vE "\s$COMPONENT(\s|$)")
-                
-                if [ -n "$lines_to_modify" ]; then
-                    
-                    # Step 2: Use sed to perform the insertion ONLY on the filtered lines
-                    local modified_content
-                    modified_content=$(echo "$lines_to_modify" | sed -E "s/(\s+main)(\s+.*)/\1 ${COMPONENT}\2/I")
-
-                    # Step 3: Use sed to replace the original lines in the file with the new lines
-                    # This is complex, so we will use a simpler `awk` approach for modification instead of `sed`.
-                    
-                    # RETHINK: Let's stick to the previous sed structure but fix the quoting.
-                    # The issue is the nested parentheses being misinterpreted by the shell.
-                    # Let's use simple substitution logic that relies on the outer loop's filtering.
-                    
-                    local sed_command
-                    # This command targets lines with the URI AND main, and performs the substitution if the component is missing.
-                    sed_command="/(${DEBIAN_URIS})/ { /main/I !/\s${COMPONENT}/ s/(\s+main)(\s+.*)/\1 ${COMPONENT}\2/I; }"
-                    
-                    if sed -E "$sed_command" "$file" > "$temp_file"; then
-                        
-                        if ! cmp -s "$file" "$temp_file"; then
-                            echo "-> Inserted '${COMPONENT}' into ${file}."
-                            mv "$temp_file" "$file"
-                            component_added=1
-                        else
-                            rm "$temp_file"
-                        fi
-                    else
-                        echo "❌ Error: Failed to process ${file} with sed while adding ${COMPONENT}. Syntax failed again."
-                        rm "$temp_file"
-                        return 1
-                    fi
-                fi
+                # Build the SED command line by line: filter by URI, check for 'main', check for component presence, then substitute
+                # Note: We do not use nested { } here to prevent the syntax error.
+                # The final substitution will happen on every line that matches the address filters.
+                SED_SCRIPT="${SED_SCRIPT} /^deb/I { /${DEBIAN_URIS}/ { /main/I !/\s${COMPONENT}/ s/(\s+main)(\s+.*)/\1 ${COMPONENT}\2/I; } }; "
+                component_added=1
             fi
         done
         
+        # Execute the combined SED script if any component was missing
         if [ "$component_added" -eq 1 ]; then
-            echo "-> Finished applying updates to ${file}."
+            temp_file=$(mktemp)
+            
+            # Use a slightly different sed syntax without the complex nested addresses if possible.
+            # Rerunning the full file through sed multiple times is the most robust way to ensure no quoting issues.
+            
+            local current_file="$file"
+            
+            for COMPONENT in "${REQUIRED_COMPONENTS[@]}"; do
+                
+                # Check if the component is STILL missing in the currently processed file state
+                if ! grep -vE '^\s*#' "$current_file" | grep -qE "deb.*(${DEBIAN_URIS}).*(\s$COMPONENT|\s$COMPONENT\s)"; then
+
+                    # Only process lines that contain both the URI and 'main' AND do not contain the component
+                    # Use awk for robust modification to avoid sed's quoting issues.
+                    if awk -v component_to_add="$COMPONENT" -v uris="$DEBIAN_URIS" '
+                        /^(deb|deb-src)/ && /main/ {
+                            if ($0 ~ uris) {
+                                # Check if component is missing (using space boundaries)
+                                if ($0 !~ "[[:space:]]" component_to_add "[[:space:]]") {
+                                    sub(/main/, "main " component_to_add, $0);
+                                }
+                            }
+                        }
+                        { print }
+                    ' "$current_file" > "$temp_file"; then
+                        
+                        # Move the newly modified file back, making it the current file for the next loop iteration
+                        mv "$temp_file" "$current_file"
+                    else
+                        echo "❌ Error: Failed to process ${file} with awk while adding ${COMPONENT}."
+                        return 1
+                    fi
+                fi
+            done
+            
+            # Final check and move
+            if [ -f "$current_file" ] && ! cmp -s "$file" "$current_file"; then
+                echo "-> Finished applying updates to ${file}. Components added: ${REQUIRED_COMPONENTS[*]}."
+                mv "$current_file" "$file"
+            else
+                echo "-> All required components are already present in ${file}. Skipping."
+                rm "$current_file" 2>/dev/null
+            fi
         else
             echo "-> All required components are already present in ${file}. Skipping."
         fi
@@ -188,10 +181,10 @@ add_to_sources_file() {
             echo "-> Finished applying updates to ${file}."
         else
             echo "-> All required components are already present in ${file}. Skipping."
-        }
+        fi
     else
         echo "-> File ${file} does not contain official Debian entries. Skipping component addition."
-    }
+    fi
 }
 
 # -----------------------------------------------------------------------
@@ -223,6 +216,7 @@ if [ -f "$MAIN_FILE" ]; then
     if grep -q '^Types:' "$MAIN_FILE"; then
         add_to_sources_file "$MAIN_FILE"
     else
+        # Use the highly robust, multi-pass awk function for .list files now
         add_to_list_file "$MAIN_FILE"
     fi
 else
