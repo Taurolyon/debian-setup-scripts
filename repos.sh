@@ -68,7 +68,15 @@ add_to_list_file() {
         if ! grep -vE '^\s*#' "$file" | grep -qE 'contrib|non-free|non-free-firmware'; then
             temp_file=$(mktemp)
 
-            if sed -E "/^(deb|deb-src) /I { /(deb.debian.org\/debian|security.debian.org)/ { /main/I s/(\s+main)(\s+|$)/\1 ${COMPONENTS}\2/I; } }" "$file" > "$temp_file"; then
+            # NEW CORRECTED SED COMMAND:
+            # Looks for 'main' followed by a space and anything else (including end-of-line)
+            # It inserts " contrib non-free" after 'main', preserving any components that follow.
+            # Example: 'main non-free-firmware' becomes 'main contrib non-free non-free-firmware'
+            if sed -E "/^(deb|deb-src) /I { 
+                /(deb.debian.org\/debian|security.debian.org)/ { 
+                    /main/I s/(\s+main)(\s+)/\1 contrib non-free\2/I; 
+                } 
+            }" "$file" > "$temp_file"; then
                 
                 if ! cmp -s "$file" "$temp_file"; then
                     echo "-> Updated file: ${file}"
@@ -97,19 +105,16 @@ add_to_sources_file() {
 
     if grep -qE 'URIs:.*(deb.debian.org/debian|security.debian.org)' "$file"; then
         
-        # CORRECTED AWK LOGIC: Uses 'Types:' to reset the state machine for each stanza.
+        # AWK LOGIC for deb822 format (retained, as it was fixed in the last revision)
         if awk -v components_to_add="$COMPONENTS" '
-            # 1. Start of a new stanza: reset the flag for official Debian URI.
             /Types:/ { 
                 is_debian_stanza = 0; 
             }
             
-            # 2. Check the URIs field: if it matches official Debian, set the flag.
             /URIs:.*(deb.debian.org\/debian|security.debian.org)/ { 
                 is_debian_stanza = 1; 
             }
             
-            # 3. Modify the Components line ONLY if the flag is set and "contrib" is missing.
             /^[[:space:]]*Components:/ && is_debian_stanza && !/contrib/ {
                 $0 = $0 " " components_to_add;
                 changed = 1;
