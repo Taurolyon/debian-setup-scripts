@@ -21,7 +21,7 @@ echo "✅ Running script with root privileges."
 # --- Functions ---
 # -----------------------------------------------------------------------
 
-# --- Architecture Check and Enable Function (Included for completeness) ---
+# --- Architecture Check and Enable Function ---
 check_and_enable_i386() {
     echo "Checking for i386 architecture support..."
     if dpkg --print-foreign-architectures | grep -q 'i386'; then
@@ -64,24 +64,32 @@ add_to_list_file() {
     local file="$1"
     local temp_file
     
-    if ! grep -vE '^\s*#' "$file" | grep -qE 'contrib|non-free|non-free-firmware'; then
-        temp_file=$(mktemp)
+    # NEW LOGIC: Check for official Debian URIs only (http://deb.debian.org/debian or http://security.debian.org)
+    # This prevents adding components to third-party repos like Brave.
+    if grep -qE 'deb.*(deb.debian.org/debian|security.debian.org)' "$file"; then
+        # Check if the components are already present (ignoring commented lines)
+        if ! grep -vE '^\s*#' "$file" | grep -qE 'contrib|non-free|non-free-firmware'; then
+            temp_file=$(mktemp)
 
-        if sed -E "/^(deb|deb-src) /I { /main/I s/(\s+main)(\s+|$)/\1 ${COMPONENTS}\2/I; }" "$file" > "$temp_file"; then
-            
-            if ! cmp -s "$file" "$temp_file"; then
-                echo "-> Updated file: ${file}"
-                mv "$temp_file" "$file"
+            # Restrict sed command to lines containing a Debian official URI.
+            if sed -E "/^(deb|deb-src) /I { /(deb.debian.org\/debian|security.debian.org)/ { /main/I s/(\s+main)(\s+|$)/\1 ${COMPONENTS}\2/I; } }" "$file" > "$temp_file"; then
+                
+                if ! cmp -s "$file" "$temp_file"; then
+                    echo "-> Updated file: ${file}"
+                    mv "$temp_file" "$file"
+                else
+                    echo "-> Official entries already updated or 'main' not found. No changes made."
+                    rm "$temp_file"
+                fi
             else
-                echo "-> Components already present or 'main' not found in an entry in ${file}. No changes made."
+                echo "Error: Failed to process ${file} with sed."
                 rm "$temp_file"
             fi
         else
-            echo "Error: Failed to process ${file} with sed."
-            rm "$temp_file"
+            echo "-> Components already present in official entries in ${file}. Skipping."
         fi
     else
-        echo "-> Components already present in ${file}. Skipping."
+        echo "-> File ${file} does not contain official Debian entries. Skipping component addition."
     fi
 }
 
@@ -91,23 +99,40 @@ add_to_sources_file() {
     local temp_file
     temp_file=$(mktemp)
 
-    if awk -v components_to_add="$COMPONENTS" '
-        /^[[:space:]]*Components:/ && !/contrib/ {
-            $0 = $0 " " components_to_add
-            changed = 1
-        }
-        { print }
-        END { exit !changed }
-    ' "$file" > "$temp_file"; then
-        echo "-> Updated file: ${file}"
-        mv "$temp_file" "$file"
-    else
-        if grep -qE '^[[:space:]]*Components:.*(contrib|non-free|non-free-firmware)' "$file"; then
-            echo "-> Components already present in ${file}. Skipping."
+    # NEW LOGIC: Use grep to pre-check if the file contains official Debian URIs.
+    if grep -qE 'URIs:.*(deb.debian.org/debian|security.debian.org)' "$file"; then
+        
+        # Awk logic: Only target stanzas (blocks) that contain the official URIs 
+        # and append components to their "Components:" line if "contrib" is missing.
+        if awk -v components_to_add="$COMPONENTS" '
+            /URIs:.*(deb.debian.org\/debian|security.debian.org)/ {
+                is_debian_stanza = 1; # Flag that we are inside a Debian block
+            }
+            
+            /^[[:space:]]*Components:/ && is_debian_stanza && !/contrib/ {
+                $0 = $0 " " components_to_add;
+                changed = 1;
+            }
+            
+            # Reset flag after a blank line or start of new block
+            /^$/ { is_debian_stanza = 0 }
+            /Types:/ && !/URIs:.*(deb.debian.org\/debian|security.debian.org)/ { is_debian_stanza = 0 }
+            
+            { print }
+            END { exit !changed }
+        ' "$file" > "$temp_file"; then
+            echo "-> Updated file: ${file}"
+            mv "$temp_file" "$file"
         else
-            echo "-> Could not find 'Components:' line to update in ${file} or no change was necessary."
+            if grep -qE '^[[:space:]]*Components:.*(contrib|non-free|non-free-firmware)' "$file"; then
+                echo "-> Official entries already updated. Skipping."
+            else
+                echo "-> Could not find 'Components:' line to update in official entry of ${file} or no change was necessary."
+            fi
+            rm "$temp_file"
         fi
-        rm "$temp_file"
+    else
+        echo "-> File ${file} does not contain official Debian entries. Skipping component addition."
     fi
 }
 
