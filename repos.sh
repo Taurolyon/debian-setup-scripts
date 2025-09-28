@@ -64,14 +64,10 @@ add_to_list_file() {
     local file="$1"
     local temp_file
     
-    # NEW LOGIC: Check for official Debian URIs only (http://deb.debian.org/debian or http://security.debian.org)
-    # This prevents adding components to third-party repos like Brave.
     if grep -qE 'deb.*(deb.debian.org/debian|security.debian.org)' "$file"; then
-        # Check if the components are already present (ignoring commented lines)
         if ! grep -vE '^\s*#' "$file" | grep -qE 'contrib|non-free|non-free-firmware'; then
             temp_file=$(mktemp)
 
-            # Restrict sed command to lines containing a Debian official URI.
             if sed -E "/^(deb|deb-src) /I { /(deb.debian.org\/debian|security.debian.org)/ { /main/I s/(\s+main)(\s+|$)/\1 ${COMPONENTS}\2/I; } }" "$file" > "$temp_file"; then
                 
                 if ! cmp -s "$file" "$temp_file"; then
@@ -99,24 +95,25 @@ add_to_sources_file() {
     local temp_file
     temp_file=$(mktemp)
 
-    # NEW LOGIC: Use grep to pre-check if the file contains official Debian URIs.
     if grep -qE 'URIs:.*(deb.debian.org/debian|security.debian.org)' "$file"; then
         
-        # Awk logic: Only target stanzas (blocks) that contain the official URIs 
-        # and append components to their "Components:" line if "contrib" is missing.
+        # CORRECTED AWK LOGIC: Uses 'Types:' to reset the state machine for each stanza.
         if awk -v components_to_add="$COMPONENTS" '
-            /URIs:.*(deb.debian.org\/debian|security.debian.org)/ {
-                is_debian_stanza = 1; # Flag that we are inside a Debian block
+            # 1. Start of a new stanza: reset the flag for official Debian URI.
+            /Types:/ { 
+                is_debian_stanza = 0; 
             }
             
+            # 2. Check the URIs field: if it matches official Debian, set the flag.
+            /URIs:.*(deb.debian.org\/debian|security.debian.org)/ { 
+                is_debian_stanza = 1; 
+            }
+            
+            # 3. Modify the Components line ONLY if the flag is set and "contrib" is missing.
             /^[[:space:]]*Components:/ && is_debian_stanza && !/contrib/ {
                 $0 = $0 " " components_to_add;
                 changed = 1;
             }
-            
-            # Reset flag after a blank line or start of new block
-            /^$/ { is_debian_stanza = 0 }
-            /Types:/ && !/URIs:.*(deb.debian.org\/debian|security.debian.org)/ { is_debian_stanza = 0 }
             
             { print }
             END { exit !changed }
