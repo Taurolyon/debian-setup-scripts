@@ -68,22 +68,28 @@ add_to_list_file() {
     local file="$1"
     local temp_file
     
+    # 1. Check if it's an official Debian source file
     if grep -qE 'deb.*(deb.debian.org/debian|security.debian.org)' "$file"; then
-        if ! grep -vE '^\s*#' "$file" | grep -qE 'contrib|non-free|non-free-firmware'; then
+        
+        # 2. Check if it is MISSING 'contrib' OR 'non-free' in any active line
+        if ! grep -vE '^\s*#' "$file" | grep -qE 'contrib|non-free'; then
             temp_file=$(mktemp)
 
-            # CORRECTED SED COMMAND: More flexible to handle components already present after 'main'
+            # CORRECTED SED COMMAND (Now only adds missing components: contrib non-free)
+            # It looks for 'main' followed by a space and ANYTHING else (including non-free-firmware)
             if sed -E "/^(deb|deb-src) /I { 
                 /(deb.debian.org\/debian|security.debian.org)/ { 
-                    /main/I s/(\s+main)(\s+)/\1 contrib non-free\2/I; 
+                    # Match 'main' followed by a space, and capture everything after the space (e.g., 'non-free-firmware')
+                    /main/I s/(\s+main)(\s+.*)/\1 contrib non-free\2/I; 
                 } 
             }" "$file" > "$temp_file"; then
                 
+                # Check if the file was modified
                 if ! cmp -s "$file" "$temp_file"; then
-                    echo "-> Updated file: ${file}"
+                    echo "-> Updated file: ${file} (Added missing contrib and non-free)"
                     mv "$temp_file" "$file"
                 else
-                    echo "-> Official entries already updated or 'main' not found. No changes made."
+                    echo "-> Official entries already contain contrib/non-free. No changes made."
                     rm "$temp_file"
                 fi
             else
@@ -91,7 +97,7 @@ add_to_list_file() {
                 rm "$temp_file"
             fi
         else
-            echo "-> Components already present in official entries in ${file}. Skipping."
+            echo "-> Components (contrib/non-free) already present in official entries in ${file}. Skipping."
         fi
     else
         echo "-> File ${file} does not contain official Debian entries. Skipping component addition."
